@@ -3,6 +3,7 @@ import { createServer as createViteServer } from "vite";
 import mongoose from "mongoose";
 import cors from "cors";
 import path from "path";
+import fs from "fs";
 import dotenv from "dotenv";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
@@ -36,6 +37,8 @@ import {
   CampaignResult,
   CampaignTracker,
   MarketingReport,
+  Category,
+  ProcessedRequest,
   IUser,
   UserRole
 } from "./models.ts";
@@ -45,7 +48,56 @@ dotenv.config();
 
 const app = express();
 const PORT = 3000;
-const upload = multer({ storage: multer.memoryStorage() });
+
+// Ensure uploads directory exists
+const uploadsDir = path.join(process.cwd(), "uploads");
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, "uploads/");
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
+    cb(null, uniqueSuffix + "-" + file.originalname);
+  },
+});
+
+const upload = multer({ storage });
+
+// Idempotency Middleware
+const checkIdempotency = async (req: Request, res: Response, next: NextFunction) => {
+  const key = req.header("X-Idempotency-Key");
+  if (!key) return next();
+
+  try {
+    const existing = await ProcessedRequest.findOne({ idempotencyKey: key });
+    if (existing) {
+      return res.status(existing.responseStatus).json(existing.responseBody);
+    }
+
+    // Wrap res.json to capture the response for future requests with the same key
+    const originalJson = res.json;
+    res.json = function (body) {
+      const responseStatus = res.statusCode;
+      // We don't await here to avoid blocking the response, but ideally we should handle errors
+      ProcessedRequest.create({
+        idempotencyKey: key,
+        responseStatus,
+        responseBody: body
+      }).catch(err => console.error("Failed to store idempotency key:", err));
+      
+      return originalJson.call(this, body);
+    };
+
+    next();
+  } catch (err) {
+    console.error("Idempotency check failed:", err);
+    next();
+  }
+};
 
 // Trust proxy for Cloud Run/Nginx
 app.set("trust proxy", 1);
@@ -56,13 +108,15 @@ app.use(helmet({
 }));
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 requests per windowMs
+  max: 1000, // Limit each IP to 1000 requests per windowMs
 });
 app.use("/api/", limiter);
 
 app.use(cors({ origin: true, credentials: true }));
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(cookieParser());
+app.use("/uploads", express.static(uploadsDir));
 
 const ACCESS_TOKEN_SECRET = process.env.ACCESS_TOKEN_SECRET || "access_secret_123";
 const REFRESH_TOKEN_SECRET = process.env.REFRESH_TOKEN_SECRET || "refresh_secret_123";
@@ -82,7 +136,9 @@ async function connectDB() {
       await db.collection('customers').dropIndex('phone_1').catch(() => {});
       await db.collection('marketingleads').dropIndex('phone_1').catch(() => {});
       await db.collection('salesleads').dropIndex('phone_1').catch(() => {});
+      await db.collection('salesleads').dropIndex('name_1_phone_1').catch(() => {});
       await db.collection('suppliers').dropIndex('email_1').catch(() => {});
+      await db.collection('users').dropIndex('email_1').catch(() => {});
       await db.collection('inventories').dropIndex('name_1').catch(() => {});
       console.log("Dropped unique indexes to ensure clean state");
     } catch (e) {
@@ -120,6 +176,13 @@ const SalesOrderSchemaZod = z.object({
   customerEmail: z.string().email(),
   totalAmount: z.number().positive(),
   notes: z.string().optional(),
+  quotationItems: z.array(z.object({
+    itemId: z.string(),
+    quantity: z.number().positive(),
+    price: z.number().nonnegative(),
+  })).optional(),
+  discountPercentage: z.number().min(0).max(100).optional(),
+  discountAmount: z.number().min(0).optional(),
 });
 
 // --- Auth Utilities ---
@@ -179,22 +242,129 @@ const makerChecker = async (req: AuthRequest, res: Response, next: NextFunction)
   if (req.user?.role !== "Sales" || req.method !== "PATCH") return next();
 
   const protectedFields = ["customerName", "customerPhone", "customerEmail", "totalAmount"];
-  const isProtectedEdit = Object.keys(req.body).some(key => protectedFields.includes(key));
+  const { id } = req.params;
+  
+  try {
+    const order = await SalesOrder.findById(id);
+    if (!order) return next();
 
-  if (isProtectedEdit) {
-    const { id } = req.params;
-    await ModificationRequest.create({
-      entityId: new mongoose.Types.ObjectId(id),
-      entityType: "SalesOrder",
-      requestedBy: req.user?._id,
-      changes: req.body,
+    const protectedChanges: any = {};
+    const hasProtectedChanges = Object.keys(req.body).some(key => {
+      if (!protectedFields.includes(key)) return false;
+      const isChanged = String(req.body[key]) !== String((order as any)[key]);
+      if (isChanged) {
+        protectedChanges[key] = req.body[key];
+      }
+      return isChanged;
     });
-    return res.json({ message: "Modification request created for admin approval", status: "PENDING_APPROVAL" });
+
+    if (hasProtectedChanges) {
+      await ModificationRequest.create({
+        entityId: new mongoose.Types.ObjectId(id),
+        entityType: "SalesOrder",
+        requestedBy: req.user?._id,
+        changes: protectedChanges,
+      });
+      
+      // Remove protected fields from req.body so they are not updated immediately
+      protectedFields.forEach(field => {
+        delete req.body[field];
+      });
+      
+      // Set a flag to inform the next handler that some fields are pending approval
+      (req as any).pendingApproval = true;
+    }
+  } catch (error) {
+    console.error("MakerChecker error:", error);
   }
   next();
 };
 
 // --- API Routes ---
+
+// Inventory
+// --- Inventory: Categories ---
+app.get("/api/inventory/categories", authenticate, async (req: AuthRequest, res: Response) => {
+  const categories = await Category.find();
+  res.json(categories);
+});
+
+app.post("/api/inventory/categories", authenticate, authorize(["SuperAdmin", "Admin", "Operations"]), checkIdempotency, async (req: AuthRequest, res: Response) => {
+  try {
+    const category = await Category.create(req.body);
+    res.status(201).json(category);
+  } catch (error: any) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.delete("/api/inventory/categories/:id", authenticate, authorize(["SuperAdmin", "Admin", "Operations"]), async (req: AuthRequest, res: Response) => {
+  try {
+    await Category.findByIdAndDelete(req.params.id);
+    res.json({ message: "Category deleted" });
+  } catch (error: any) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/inventory", authenticate, async (req: AuthRequest, res: Response) => {
+  try {
+    const items = await Inventory.find().sort({ createdAt: -1 });
+    res.json(items);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch inventory" });
+  }
+});
+
+app.post("/api/inventory", authenticate, authorize(["SuperAdmin", "Admin", "Operations"]), upload.single("dataSheet"), checkIdempotency, async (req: AuthRequest, res: Response) => {
+  try {
+    const { itemName, specification, category, unitPrice, stockNumber, notes } = req.body;
+    const lastItem = await Inventory.findOne().sort({ createdAt: -1 });
+    const lastId = lastItem && lastItem.sparePartsId ? parseInt(lastItem.sparePartsId.split('-')[1] || '0') : 0;
+    const sparePartsId = `SP-${lastId + 1}`;
+    
+    let dataSheetUrl = "";
+    if (req.file) {
+      dataSheetUrl = `/uploads/${req.file.filename}`;
+    }
+
+    const item = await Inventory.create({
+      sparePartsId,
+      itemName,
+      specification,
+      category,
+      unitPrice,
+      stockNumber,
+      notes,
+      dataSheetUrl
+    });
+    res.json(item);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to create inventory item" });
+  }
+});
+
+app.patch("/api/inventory/:id", authenticate, authorize(["SuperAdmin", "Admin", "Operations"]), upload.single("dataSheet"), checkIdempotency, async (req: AuthRequest, res: Response) => {
+  try {
+    const updateData = { ...req.body };
+    if (req.file) {
+      updateData.dataSheetUrl = `/uploads/${req.file.filename}`;
+    }
+    const item = await Inventory.findByIdAndUpdate(req.params.id, updateData, { new: true });
+    res.json(item);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to update inventory item" });
+  }
+});
+
+app.delete("/api/inventory/:id", authenticate, authorize(["SuperAdmin", "Admin", "Operations"]), async (req: AuthRequest, res: Response) => {
+  try {
+    await Inventory.findByIdAndDelete(req.params.id);
+    res.json({ message: "Item deleted" });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to delete inventory item" });
+  }
+});
 
 // Auth
 app.post("/api/auth/login", async (req, res) => {
@@ -204,6 +374,10 @@ app.post("/api/auth/login", async (req, res) => {
     return res.status(401).json({ error: "Invalid credentials" });
   }
 
+  if (user.isActive === false) {
+    return res.status(403).json({ error: "Account is deactivated. Please contact an administrator." });
+  }
+
   const { accessToken, refreshToken } = generateTokens(user._id.toString());
   user.refreshToken = refreshToken;
   await user.save();
@@ -211,7 +385,7 @@ app.post("/api/auth/login", async (req, res) => {
   res.cookie("accessToken", accessToken, { httpOnly: true, secure: true, sameSite: "none", maxAge: 15 * 60 * 1000 });
   res.cookie("refreshToken", refreshToken, { httpOnly: true, secure: true, sameSite: "none", maxAge: 7 * 24 * 60 * 60 * 1000 });
 
-  res.json({ user: { id: user._id, name: user.name, role: user.role, email: user.email } });
+  res.json({ user: { id: user._id, name: user.name, role: user.role, email: user.email, maxDiscountPercentage: user.maxDiscountPercentage, isActive: user.isActive } });
 });
 
 app.post("/api/auth/refresh", async (req, res) => {
@@ -249,7 +423,7 @@ app.post("/api/auth/logout", authenticate, async (req: AuthRequest, res) => {
 });
 
 app.get("/api/auth/me", authenticate, (req: AuthRequest, res) => {
-  res.json({ user: { id: req.user?._id, name: req.user?.name, role: req.user?.role, email: req.user?.email } });
+  res.json({ user: { id: req.user?._id, name: req.user?.name, role: req.user?.role, email: req.user?.email, maxDiscountPercentage: req.user?.maxDiscountPercentage, isActive: req.user?.isActive } });
 });
 
 // CRM & Sales
@@ -261,9 +435,27 @@ app.get("/api/sales/orders", authenticate, async (req: AuthRequest, res) => {
   res.json(orders);
 });
 
-app.post("/api/sales/orders", authenticate, auditLogger, async (req: AuthRequest, res) => {
+app.post("/api/sales/orders", authenticate, auditLogger, checkIdempotency, async (req: AuthRequest, res) => {
   try {
     const validatedData = SalesOrderSchemaZod.parse(req.body);
+    
+    // Discount Validation for Sales
+    if (validatedData.discountPercentage && req.user?.role === "Sales") {
+      if (validatedData.discountPercentage > (req.user.maxDiscountPercentage || 0)) {
+        return res.status(400).json({ error: `Discount exceeds your limit of ${req.user.maxDiscountPercentage}%` });
+      }
+    }
+
+    // Price Validation for Sales
+    if (validatedData.quotationItems && req.user?.role === "Sales") {
+      for (const item of validatedData.quotationItems) {
+        const inv = await Inventory.findById(item.itemId);
+        if (inv && item.price !== inv.unitPrice) {
+          return res.status(400).json({ error: `You are not authorized to change the price of ${inv.itemName}` });
+        }
+      }
+    }
+
     const order = await SalesOrder.create({
       ...validatedData,
       salesPersonId: req.user?._id,
@@ -275,100 +467,100 @@ app.post("/api/sales/orders", authenticate, auditLogger, async (req: AuthRequest
 });
 
 // Cascading Automation Trigger
-app.patch("/api/sales/orders/:id", authenticate, makerChecker, auditLogger, async (req: AuthRequest, res) => {
-  const { id } = req.params;
-  const order = await SalesOrder.findById(id);
-  if (!order) return res.status(404).json({ error: "Order not found" });
+app.patch("/api/sales/orders/:id", authenticate, makerChecker, auditLogger, checkIdempotency, async (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const order = await SalesOrder.findById(id);
+    if (!order) return res.status(404).json({ error: "Order not found" });
 
-  // Ownership check
-  if (!["SuperAdmin", "Admin", "Manager"].includes(req.user?.role || "") && order.salesPersonId.toString() !== req.user?._id.toString()) {
-    return res.status(403).json({ error: "Unauthorized" });
+    // Ownership check
+    if (!["SuperAdmin", "Admin", "Manager"].includes(req.user?.role || "") && order.salesPersonId.toString() !== req.user?._id.toString()) {
+      return res.status(403).json({ error: "Unauthorized" });
+    }
+
+    // Discount Validation for Sales
+    if (req.body.discountPercentage && req.user?.role === "Sales") {
+      if (req.body.discountPercentage > (req.user.maxDiscountPercentage || 0)) {
+        return res.status(400).json({ error: `Discount exceeds your limit of ${req.user.maxDiscountPercentage}%` });
+      }
+    }
+
+    // Price Validation for Sales
+    if (req.body.quotationItems && req.user?.role === "Sales") {
+      for (const item of req.body.quotationItems) {
+        const inv = await Inventory.findById(item.itemId);
+        if (inv && item.price !== inv.unitPrice) {
+          return res.status(400).json({ error: `You are not authorized to change the price of ${inv.itemName}` });
+        }
+      }
+    }
+
+    const updatedOrder = await SalesOrder.findByIdAndUpdate(id, req.body, { new: true });
+    if (!updatedOrder) return res.status(404).json({ error: "Order not found" });
+
+    if ((req as any).pendingApproval) {
+      return res.json({ 
+        message: "Order details updated. Note: Changes to Name, Phone, Email, or Amount require admin approval and have been submitted for review.", 
+        status: "PENDING_APPROVAL",
+        order: updatedOrder
+      });
+    }
+
+    const isWon = 
+      updatedOrder.quotationStatusFirstFollowUp === "Accepted" || 
+      updatedOrder.finalStatusThirdFollowUp === "Accepted";
+      
+    const isLost = 
+      updatedOrder.quotationStatusFirstFollowUp === "Rejected" ||
+      updatedOrder.finalStatusThirdFollowUp === "Not Potential";
+
+    if (isLost) {
+      // Move to No Potential
+      await SalesLead.create({
+        name: updatedOrder.customerName,
+        phone: updatedOrder.customerPhone,
+        email: updatedOrder.customerEmail,
+        status: "No Potential",
+        notes: `Copied from SalesOrder: ${updatedOrder._id}. Reason: Status is Not Potential.`,
+      });
+      await SalesOrder.findByIdAndDelete(id);
+      return res.json({ message: "Order moved to SalesLead as 'No Potential'." });
+    }
+
+    if (isWon && !updatedOrder.automationTriggered) {
+      // Idempotency: Mark as triggered
+      updatedOrder.automationTriggered = true;
+      await updatedOrder.save();
+
+      // 1. Create Customer Order (Snapshot Context)
+      const customerOrder = await CustomerOrder.create({
+        salesOrderId: updatedOrder._id,
+        orderContext: {
+          customerName: updatedOrder.customerName,
+          customerPhone: updatedOrder.customerPhone,
+          customerEmail: updatedOrder.customerEmail,
+          totalAmount: updatedOrder.totalAmount,
+        },
+      });
+
+      // 2. Auto-generate Work Order
+      await WorkOrder.create({
+        customerOrderId: customerOrder._id,
+      });
+
+      // 3. Auto-generate Invoice Draft
+      await Invoice.create({
+        customerOrderId: customerOrder._id,
+        total: updatedOrder.totalAmount,
+        status: "Draft",
+      });
+    }
+
+    res.json(updatedOrder);
+  } catch (err: any) {
+    console.error("Error updating order:", err);
+    res.status(400).json({ error: err.errors || "Update failed" });
   }
-
-  const updatedOrder = await SalesOrder.findByIdAndUpdate(id, req.body, { new: true });
-  if (!updatedOrder) return res.status(404).json({ error: "Order not found" });
-
-  // --- Restriction Check ---
-  const oldStatuses = [
-    order.quotationStatusFirstFollowUp,
-    order.statusSecondFollowUp,
-    order.finalStatusThirdFollowUp
-  ];
-  const oldIsWon = oldStatuses.some(s => s === "Accepted" || s === "Scheduled");
-  
-  const newStatuses = [
-    updatedOrder.quotationStatusFirstFollowUp,
-    updatedOrder.statusSecondFollowUp,
-    updatedOrder.finalStatusThirdFollowUp
-  ];
-  const newIsWon = newStatuses.some(s => s === "Accepted" || s === "Scheduled");
-
-  if (oldIsWon && !newIsWon && order.automationTriggered) {
-    return res.status(400).json({ error: "Cannot change order status from 'Yes' to 'No' as automation has already been triggered." });
-  }
-
-  // Handle "Yes" to "No" transition: Copy to SalesLead and delete SalesOrder
-  if (oldIsWon && !newIsWon) {
-    await SalesLead.create({
-      name: updatedOrder.customerName,
-      phone: updatedOrder.customerPhone,
-      email: updatedOrder.customerEmail,
-      status: "No Potential",
-      notes: `Copied from SalesOrder: ${updatedOrder._id}. Reason: Status changed to No.`,
-    });
-    await SalesOrder.findByIdAndDelete(id);
-    return res.json({ message: "Order moved to SalesLead as 'No Potential'." });
-  }
-  // -------------------------
-
-  // Automation Logic: "Accepted" or "Scheduled" in ANY stage
-  const statuses = [
-    updatedOrder.quotationStatusFirstFollowUp,
-    updatedOrder.statusSecondFollowUp,
-    updatedOrder.finalStatusThirdFollowUp
-  ];
-  
-  const isWon = statuses.some(s => s === "Accepted" || s === "Scheduled");
-  const isFollowUpNeeded = statuses.some(s => s === "Quoted" || s === "Rejected");
-
-  if (isWon && !updatedOrder.automationTriggered) {
-    // Idempotency: Mark as triggered
-    updatedOrder.automationTriggered = true;
-    await updatedOrder.save();
-
-    // 1. Create Customer Order (Snapshot Context)
-    const customerOrder = await CustomerOrder.create({
-      salesOrderId: updatedOrder._id,
-      orderContext: {
-        customerName: updatedOrder.customerName,
-        customerPhone: updatedOrder.customerPhone,
-        customerEmail: updatedOrder.customerEmail,
-        totalAmount: updatedOrder.totalAmount,
-      },
-    });
-
-    // 2. Auto-generate Work Order
-    await WorkOrder.create({
-      customerOrderId: customerOrder._id,
-    });
-
-    // 3. Auto-generate Invoice Draft
-    await Invoice.create({
-      customerOrderId: customerOrder._id,
-      total: updatedOrder.totalAmount,
-      status: "Draft",
-    });
-  } else if (isFollowUpNeeded) {
-    // Follow-up automation
-    const type = statuses.includes("Rejected") ? "Rejected" : "Quoted";
-    await FollowUpReminder.create({
-      salesOrderId: updatedOrder._id,
-      type,
-      content: `Follow-up required for ${updatedOrder.customerName} (Status: ${type}).`,
-    });
-  }
-
-  res.json(updatedOrder);
 });
 
 // Governance & Modification Requests
@@ -405,22 +597,6 @@ app.post("/api/governance/requests/:id/resolve", authenticate, authorize(["Super
   res.json({ message: `Request ${status}` });
 });
 
-// Inventory Management
-app.get("/api/inventory", authenticate, async (req, res) => {
-  const items = await Inventory.find();
-  res.json(items);
-});
-
-app.post("/api/inventory", authenticate, authorize(["SuperAdmin", "Admin", "Operations"]), auditLogger, async (req, res) => {
-  const item = await Inventory.create(req.body);
-  res.status(201).json(item);
-});
-
-app.patch("/api/inventory/:id", authenticate, authorize(["SuperAdmin", "Admin", "Operations"]), auditLogger, async (req, res) => {
-  const item = await Inventory.findByIdAndUpdate(req.params.id, req.body, { new: true });
-  res.json(item);
-});
-
 // --- CRM: Customers ---
 async function ensureCustomerAndGetCode(name: string, phone: string, address?: string, type?: string, sector?: string, sheetId?: string) {
   let customer = await Customer.findOne({ name, phone });
@@ -446,7 +622,7 @@ app.get("/api/crm/customers", authenticate, async (req, res) => {
   res.json(customers);
 });
 
-app.post("/api/crm/customers", authenticate, authorize(["SuperAdmin", "Admin", "Sales"]), async (req, res) => {
+app.post("/api/crm/customers", authenticate, authorize(["SuperAdmin", "Admin", "Sales"]), checkIdempotency, async (req, res) => {
   try {
     const customer = await Customer.create(req.body);
     res.status(201).json(customer);
@@ -461,7 +637,7 @@ app.get("/api/scm/suppliers", authenticate, async (req, res) => {
   res.json(suppliers);
 });
 
-app.post("/api/scm/suppliers", authenticate, authorize(["SuperAdmin", "Admin", "Operations"]), async (req, res) => {
+app.post("/api/scm/suppliers", authenticate, authorize(["SuperAdmin", "Admin", "Operations"]), checkIdempotency, async (req, res) => {
   const supplier = await Supplier.create(req.body);
   res.status(201).json(supplier);
 });
@@ -471,7 +647,7 @@ app.get("/api/scm/purchase-orders", authenticate, async (req, res) => {
   res.json(pos);
 });
 
-app.post("/api/scm/purchase-orders", authenticate, authorize(["SuperAdmin", "Admin", "Operations"]), async (req, res) => {
+app.post("/api/scm/purchase-orders", authenticate, authorize(["SuperAdmin", "Admin", "Operations"]), checkIdempotency, async (req, res) => {
   const po = await PurchaseOrder.create(req.body);
   res.status(201).json(po);
 });
@@ -522,12 +698,41 @@ app.get("/api/users", authenticate, authorize(["SuperAdmin", "Admin"]), async (r
   res.json(users);
 });
 
-app.post("/api/users", authenticate, authorize(["SuperAdmin"]), auditLogger, async (req, res) => {
-  const { name, email, password, role, targetSales, targetBudget } = req.body;
-  const salt = await bcrypt.genSalt(10);
-  const passwordHash = await bcrypt.hash(password, salt);
-  const user = await User.create({ name, email, passwordHash, role, targetSales, targetBudget });
-  res.status(201).json({ user: { id: user._id, name: user.name, role: user.role, email: user.email } });
+app.post("/api/users", authenticate, authorize(["SuperAdmin", "Admin"]), auditLogger, checkIdempotency, async (req, res) => {
+  try {
+    const { name, email, password, role, targetSales, targetBudget, maxDiscountPercentage, isActive } = req.body;
+    const salt = await bcrypt.genSalt(10);
+    const passwordHash = await bcrypt.hash(password, salt);
+    const user = await User.create({ name, email, passwordHash, role, targetSales, targetBudget, maxDiscountPercentage, isActive: isActive !== undefined ? isActive : true });
+    res.status(201).json({ user: { id: user._id, name: user.name, role: user.role, email: user.email, isActive: user.isActive } });
+  } catch (error: any) {
+    if (error.code === 11000) {
+      return res.status(400).json({ error: "Email already exists" });
+    }
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.patch("/api/users/:id", authenticate, authorize(["SuperAdmin", "Admin"]), auditLogger, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updateData = { ...req.body };
+    if (updateData.email) {
+      updateData.email = updateData.email.toLowerCase();
+    }
+    if (updateData.password) {
+      const salt = await bcrypt.genSalt(10);
+      updateData.passwordHash = await bcrypt.hash(updateData.password, salt);
+      delete updateData.password;
+    }
+    const user = await User.findByIdAndUpdate(id, updateData, { new: true });
+    res.json(user);
+  } catch (error: any) {
+    if (error.code === 11000) {
+      return res.status(400).json({ error: "Email already exists" });
+    }
+    res.status(400).json({ error: error.message });
+  }
 });
 
 // Seed SuperAdmin
@@ -569,7 +774,7 @@ app.post("/api/ops/work-orders/:id/complete", authenticate, authorize(["Admin", 
     for (const item of partsUsed) {
       const inv = await Inventory.findById(item.partId).session(session);
       if (!inv || inv.stockNumber < item.quantity) {
-        throw new Error(`Insufficient stock for ${inv?.name || "item"}`);
+        throw new Error(`Insufficient stock for ${inv?.itemName || "item"}`);
       }
       inv.stockNumber -= item.quantity;
       await inv.save({ session });
@@ -742,7 +947,7 @@ app.delete("/api/scm/suppliers/:id", authenticate, authorize(["SuperAdmin", "Adm
   }
 });
 
-app.post("/api/marketing/leads", authenticate, authorize(["SuperAdmin", "Admin", "Marketing"]), async (req, res) => {
+app.post("/api/marketing/leads", authenticate, authorize(["SuperAdmin", "Admin", "Marketing"]), checkIdempotency, async (req, res) => {
   try {
     const leadData = {
       ...req.body,
@@ -777,7 +982,7 @@ app.post("/api/marketing/leads", authenticate, authorize(["SuperAdmin", "Admin",
   }
 });
 
-app.post("/api/marketing/sheets", authenticate, authorize(["SuperAdmin", "Admin"]), upload.single("serviceAccountFile"), async (req: AuthRequest, res: Response) => {
+app.post("/api/marketing/sheets", authenticate, authorize(["SuperAdmin", "Admin"]), upload.single("serviceAccountFile"), checkIdempotency, async (req: AuthRequest, res: Response) => {
   let { spreadsheetId, serviceAccountKey } = req.body;
   
   if (req.file) {
@@ -809,7 +1014,7 @@ app.post("/api/marketing/sheets", authenticate, authorize(["SuperAdmin", "Admin"
   }
 });
 
-app.post("/api/marketing/leads/preview-sync", authenticate, authorize(["SuperAdmin", "Admin"]), upload.single("serviceAccountFile"), async (req: AuthRequest, res: Response) => {
+app.post("/api/marketing/leads/preview-sync", authenticate, authorize(["SuperAdmin", "Admin"]), upload.single("serviceAccountFile"), checkIdempotency, async (req: AuthRequest, res: Response) => {
   let { spreadsheetId, sheetName, serviceAccountKey, saveConfig, name } = req.body;
   
   if (req.file) {
@@ -901,7 +1106,7 @@ app.post("/api/marketing/leads/preview-sync", authenticate, authorize(["SuperAdm
   }
 });
 
-app.post("/api/marketing/leads/commit-sync", authenticate, authorize(["SuperAdmin", "Admin"]), async (req, res) => {
+app.post("/api/marketing/leads/commit-sync", authenticate, authorize(["SuperAdmin", "Admin"]), checkIdempotency, async (req, res) => {
   const { leads } = req.body;
   if (!leads || !Array.isArray(leads)) return res.status(400).json({ error: "Leads array required" });
 
@@ -957,7 +1162,7 @@ app.post("/api/marketing/leads/commit-sync", authenticate, authorize(["SuperAdmi
   }
 });
 
-app.post("/api/marketing/leads/sync-sheets", authenticate, authorize(["SuperAdmin", "Admin"]), upload.single("serviceAccountFile"), async (req: AuthRequest, res: Response) => {
+app.post("/api/marketing/leads/sync-sheets", authenticate, authorize(["SuperAdmin", "Admin"]), upload.single("serviceAccountFile"), checkIdempotency, async (req: AuthRequest, res: Response) => {
   let { spreadsheetId, sheetName, serviceAccountKey, saveConfig, name } = req.body;
   
   // If a file was uploaded, use its content as the service account key
@@ -1080,20 +1285,28 @@ app.post("/api/marketing/leads/sync-sheets", authenticate, authorize(["SuperAdmi
 });
 
 app.get("/api/sales/leads", authenticate, async (req, res) => {
-  const leads = await SalesLead.find({ status: { $ne: "No Potential" } })
-    .populate("assignedTo", "name")
-    .sort({ createdAt: -1 });
-  res.json(leads);
+  try {
+    const leads = await SalesLead.find({ status: { $ne: "No Potential" } })
+      .sort({ createdAt: -1 });
+    res.json(leads);
+  } catch (error: any) {
+    console.error("Error fetching leads:", error);
+    res.status(500).json({ error: "Failed to fetch leads" });
+  }
 });
 
 app.get("/api/sales/leads/non-potential", authenticate, async (req, res) => {
-  const leads = await SalesLead.find({ status: "No Potential" })
-    .populate("assignedTo", "name")
-    .sort({ createdAt: -1 });
-  res.json(leads);
+  try {
+    const leads = await SalesLead.find({ status: "No Potential" })
+      .sort({ createdAt: -1 });
+    res.json(leads);
+  } catch (error: any) {
+    console.error("Error fetching non-potential leads:", error);
+    res.status(500).json({ error: "Failed to fetch non-potential leads" });
+  }
 });
 
-app.patch("/api/sales/leads/:id", authenticate, authorize(["SuperAdmin", "Admin", "Sales"]), async (req: AuthRequest, res) => {
+app.patch("/api/sales/leads/:id", authenticate, authorize(["SuperAdmin", "Admin", "Sales"]), checkIdempotency, async (req: AuthRequest, res) => {
   try {
     const { id } = req.params;
     const { orderCreated, ...updateData } = req.body;
@@ -1127,59 +1340,38 @@ app.patch("/api/sales/leads/:id", authenticate, authorize(["SuperAdmin", "Admin"
       // Create SalesOrder
       await SalesOrder.create({
         salesPersonId: req.user._id,
+        customerCode: lead.customerCode,
         customerName: lead.name,
         customerPhone: lead.phone,
         customerEmail: lead.email || "N/A",
+        address: lead.address,
+        sector: lead.sector,
+        initialIssue: lead.issue,
         totalAmount: 0,
-        quotationStatusFirstFollowUp: "Pending",
-        statusSecondFollowUp: "Pending",
-        finalStatusThirdFollowUp: "Pending",
+        quotationStatusFirstFollowUp: "Select Status",
+        statusSecondFollowUp: "Select Status",
+        finalStatusThirdFollowUp: "Select Final Status",
       });
     } else if (orderCreated === "no") {
       updateData.status = "Lost"; // Update original lead status to Lost
-      try {
-        console.log("Creating No Potential lead copy for phone:", lead.phone);
-        // Create a copy of the lead with "No Potential" status
-        await SalesLead.create({
-          name: lead.name,
-          phone: lead.phone,
-          email: lead.email,
-          source: lead.source,
-          status: "No Potential",
-          type: lead.type,
-          sector: lead.sector,
-          address: lead.address,
-          issue: lead.issue,
-          reason: lead.reason,
-          notes: `Copy of lead ${lead._id}. Reason: Order marked as No.`,
-          assignedTo: lead.assignedTo,
-          isMarketingLead: lead.isMarketingLead,
-        });
-        console.log("No Potential lead copy created successfully.");
-      } catch (err: any) {
-        console.error("Error creating No Potential lead copy:", err);
-        if (err.code === 11000) {
-          // Duplicate key error, update existing "No Potential" lead instead
-          console.log("Duplicate key error, updating existing No Potential lead.");
-          await SalesLead.findOneAndUpdate(
-            { name: lead.name, phone: lead.phone, status: "No Potential" },
-            {
-              source: lead.source,
-              type: lead.type,
-              sector: lead.sector,
-              address: lead.address,
-              issue: lead.issue,
-              reason: lead.reason,
-              notes: `Updated copy of lead ${lead._id}. Reason: Order marked as No.`,
-              assignedTo: lead.assignedTo,
-              isMarketingLead: lead.isMarketingLead,
-            }
-          );
-          console.log("Existing No Potential lead updated successfully.");
-        } else {
-          throw err;
-        }
-      }
+      // Create a copy of the lead with "No Potential" status
+      await SalesLead.create({
+        name: lead.name,
+        phone: lead.phone,
+        email: lead.email,
+        source: lead.source,
+        status: "No Potential",
+        type: lead.type,
+        sector: lead.sector,
+        address: lead.address,
+        issue: lead.issue,
+        reason: lead.reason,
+        notes: `Copy of lead ${lead._id}. Reason: Order marked as No.`,
+        assignedTo: lead.assignedTo,
+        isMarketingLead: lead.isMarketingLead,
+      });
+      console.log("No Potential lead copy created successfully.");
+
       // Delete SalesOrder if exists
       console.log("Deleting SalesOrder for phone:", lead.phone);
       const deletedOrder = await SalesOrder.findOneAndDelete({ customerPhone: lead.phone });
@@ -1202,10 +1394,17 @@ app.patch("/api/sales/leads/:id", authenticate, authorize(["SuperAdmin", "Admin"
       if (!existingOrder) {
         await SalesOrder.create({
           salesPersonId: req.user._id,
+          customerCode: updatedLead.customerCode,
           customerName: updatedLead.name,
           customerPhone: updatedLead.phone,
           customerEmail: updatedLead.email || "no-email@provided.com",
-          totalAmount: 0, // Default amount, to be updated in Sales Orders page
+          address: updatedLead.address,
+          sector: updatedLead.sector,
+          initialIssue: updatedLead.issue,
+          totalAmount: 0,
+          quotationStatusFirstFollowUp: "Select Status",
+          statusSecondFollowUp: "Select Status",
+          finalStatusThirdFollowUp: "Select Final Status",
           notes: `Converted from Sales Lead. Source: ${updatedLead.source}. Notes: ${updatedLead.notes || ""}`
         });
       }
@@ -1244,7 +1443,7 @@ app.get("/api/marketing/campaigns", authenticate, async (req, res) => {
   res.json(campaigns);
 });
 
-app.post("/api/marketing/campaigns", authenticate, authorize(["SuperAdmin", "Admin", "Marketing"]), async (req, res) => {
+app.post("/api/marketing/campaigns", authenticate, authorize(["SuperAdmin", "Admin", "Marketing"]), checkIdempotency, async (req, res) => {
   try {
     const campaign = await MarketingCampaign.create(req.body);
     res.status(201).json(campaign);
@@ -1253,7 +1452,7 @@ app.post("/api/marketing/campaigns", authenticate, authorize(["SuperAdmin", "Adm
   }
 });
 
-app.patch("/api/marketing/campaigns/:id/results", authenticate, authorize(["SuperAdmin", "Admin", "Marketing"]), async (req, res) => {
+app.patch("/api/marketing/campaigns/:id/results", authenticate, authorize(["SuperAdmin", "Admin", "Marketing"]), checkIdempotency, async (req, res) => {
   const { id } = req.params;
   const { results } = req.body;
   try {
@@ -1270,7 +1469,7 @@ app.get("/api/marketing/content-tracker", authenticate, async (req, res) => {
   res.json(items);
 });
 
-app.post("/api/marketing/content-tracker", authenticate, authorize(["SuperAdmin", "Admin", "Marketing"]), async (req: AuthRequest, res) => {
+app.post("/api/marketing/content-tracker", authenticate, authorize(["SuperAdmin", "Admin", "Marketing"]), checkIdempotency, async (req: AuthRequest, res) => {
   try {
     const item = await ContentTracker.create({ ...req.body, owner: req.user.email });
     res.status(201).json(item);
@@ -1279,7 +1478,7 @@ app.post("/api/marketing/content-tracker", authenticate, authorize(["SuperAdmin"
   }
 });
 
-app.patch("/api/marketing/content-tracker/:id", authenticate, authorize(["SuperAdmin", "Admin", "Marketing"]), async (req: AuthRequest, res) => {
+app.patch("/api/marketing/content-tracker/:id", authenticate, authorize(["SuperAdmin", "Admin", "Marketing"]), checkIdempotency, async (req: AuthRequest, res) => {
   try {
     const { id } = req.params;
     const item = await ContentTracker.findById(id);
@@ -1303,7 +1502,7 @@ app.get("/api/marketing/campaign-tracker", authenticate, async (req, res) => {
   res.json(items);
 });
 
-app.post("/api/marketing/campaign-tracker", authenticate, authorize(["SuperAdmin", "Admin", "Marketing"]), async (req: AuthRequest, res) => {
+app.post("/api/marketing/campaign-tracker", authenticate, authorize(["SuperAdmin", "Admin", "Marketing"]), checkIdempotency, async (req: AuthRequest, res) => {
   try {
     const item = await CampaignTracker.create({ ...req.body, owner: req.user.email });
     res.status(201).json(item);
@@ -1312,7 +1511,7 @@ app.post("/api/marketing/campaign-tracker", authenticate, authorize(["SuperAdmin
   }
 });
 
-app.patch("/api/marketing/campaign-tracker/:id", authenticate, authorize(["SuperAdmin", "Admin", "Marketing"]), async (req: AuthRequest, res) => {
+app.patch("/api/marketing/campaign-tracker/:id", authenticate, authorize(["SuperAdmin", "Admin", "Marketing"]), checkIdempotency, async (req: AuthRequest, res) => {
   try {
     const { id } = req.params;
     const item = await CampaignTracker.findById(id);
@@ -1336,7 +1535,7 @@ app.get("/api/marketing/reports", authenticate, async (req, res) => {
   res.json(reports);
 });
 
-app.post("/api/marketing/reports", authenticate, authorize(["SuperAdmin", "Admin", "Marketing"]), async (req: AuthRequest, res) => {
+app.post("/api/marketing/reports", authenticate, authorize(["SuperAdmin", "Admin", "Marketing"]), checkIdempotency, async (req: AuthRequest, res) => {
   try {
     const report = await MarketingReport.create({ ...req.body, marketingCreator: req.user.email });
     res.status(201).json(report);
@@ -1345,7 +1544,7 @@ app.post("/api/marketing/reports", authenticate, authorize(["SuperAdmin", "Admin
   }
 });
 
-app.patch("/api/marketing/reports/:id", authenticate, authorize(["SuperAdmin", "Admin", "Marketing"]), async (req: AuthRequest, res) => {
+app.patch("/api/marketing/reports/:id", authenticate, authorize(["SuperAdmin", "Admin", "Marketing"]), checkIdempotency, async (req: AuthRequest, res) => {
   try {
     const { id } = req.params;
     const report = await MarketingReport.findById(id);
@@ -1369,7 +1568,7 @@ app.get("/api/marketing/campaign-results", authenticate, async (req, res) => {
   res.json(results);
 });
 
-app.post("/api/marketing/campaign-results/preview-sync", authenticate, authorize(["SuperAdmin", "Admin", "Marketing"]), upload.single("serviceAccountFile"), async (req: AuthRequest, res: Response) => {
+app.post("/api/marketing/campaign-results/preview-sync", authenticate, authorize(["SuperAdmin", "Admin", "Marketing"]), upload.single("serviceAccountFile"), checkIdempotency, async (req: AuthRequest, res: Response) => {
   let { spreadsheetId, sheetName, serviceAccountKey, saveConfig, name } = req.body;
   if (req.file) serviceAccountKey = req.file.buffer.toString("utf-8");
   if (!spreadsheetId) return res.status(400).json({ error: "Spreadsheet ID is required" });
@@ -1435,7 +1634,7 @@ app.post("/api/marketing/campaign-results/preview-sync", authenticate, authorize
   }
 });
 
-app.post("/api/marketing/campaign-results/commit-sync", authenticate, authorize(["SuperAdmin", "Admin", "Marketing"]), async (req, res) => {
+app.post("/api/marketing/campaign-results/commit-sync", authenticate, authorize(["SuperAdmin", "Admin", "Marketing"]), checkIdempotency, async (req, res) => {
   const { results } = req.body;
   if (!results || !Array.isArray(results)) return res.status(400).json({ error: "Results array required" });
 
@@ -1489,8 +1688,8 @@ app.post("/api/seed", authenticate, authorize(["SuperAdmin"]), async (req, res) 
     
     // Seed Inventory
     const inventory = await Inventory.insertMany([
-      { name: "Steel Beam", stockNumber: 50, price: 100, category: "Raw Materials" },
-      { name: "Microchip X1", stockNumber: 200, price: 15, category: "Components" }
+      { sparePartsId: "PL-1", itemName: "Item1", specification: "aaa", category: "Maintenance", unitPrice: 50, notes: "-" },
+      { sparePartsId: "PL-2", itemName: "Item2", specification: "bbb", category: "Components", unitPrice: 15, notes: "-" }
     ]);
     
     res.json({ message: "Seed successful", customers, suppliers, inventory });

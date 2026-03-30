@@ -27,6 +27,8 @@ interface User {
   name: string;
   role: "SuperAdmin" | "Admin" | "Manager" | "Sales" | "Marketing" | "Operations" | "Finance" | "HR" | "CustomerService";
   email: string;
+  maxDiscountPercentage?: number;
+  isActive?: boolean;
 }
 
 interface AuthState {

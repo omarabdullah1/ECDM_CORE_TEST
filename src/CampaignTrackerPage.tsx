@@ -39,6 +39,7 @@ const CampaignTrackerPage = () => {
     channels: [] as string[],
     goals: ""
   });
+  const [isSaving, setIsSaving] = useState(false);
 
   const isAdmin = user?.role === "SuperAdmin" || user?.role === "Admin";
   const isOwner = (item: any) => item?.owner === user?.email;
@@ -62,12 +63,19 @@ const CampaignTrackerPage = () => {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSaving) return;
+    setIsSaving(true);
     try {
+      const config = {
+        headers: {
+          "X-Idempotency-Key": crypto.randomUUID()
+        }
+      };
       if (selectedItem) {
-        await axios.patch(`/api/marketing/campaign-tracker/${selectedItem._id}`, formData);
+        await axios.patch(`/api/marketing/campaign-tracker/${selectedItem._id}`, formData, config);
         toast.success("Campaign tracker item updated successfully");
       } else {
-        await axios.post("/api/marketing/campaign-tracker", formData);
+        await axios.post("/api/marketing/campaign-tracker", formData, config);
         toast.success("Campaign tracker item added successfully");
       }
       setShowAddModal(false);
@@ -86,6 +94,8 @@ const CampaignTrackerPage = () => {
       fetchItems();
     } catch (error: any) {
       toast.error(error.response?.data?.error || "Failed to save item");
+    } finally {
+      setIsSaving(false);
     }
   };
 
@@ -386,9 +396,10 @@ const CampaignTrackerPage = () => {
           {(!selectedItem || canEdit(selectedItem)) ? (
             <button 
               type="submit"
-              className="w-full bg-neutral-900 text-white py-4 rounded-2xl font-bold hover:bg-neutral-800 transition-all shadow-lg shadow-neutral-200"
+              disabled={isSaving}
+              className="w-full bg-neutral-900 text-white py-4 rounded-2xl font-bold hover:bg-neutral-800 transition-all shadow-lg shadow-neutral-200 disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {selectedItem ? "Save Changes" : "Create Campaign Tracker"}
+              {isSaving ? "Saving..." : (selectedItem ? "Save Changes" : "Create Campaign Tracker")}
             </button>
           ) : (
             <button 

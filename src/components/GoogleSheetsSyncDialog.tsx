@@ -82,7 +82,10 @@ export function GoogleSheetsSyncDialog({ isOpen, onClose, syncType, onSyncComple
       }
       
       const res = await axios.post("/api/marketing/sheets", formData, {
-        headers: { "Content-Type": "multipart/form-data" }
+        headers: { 
+          "Content-Type": "multipart/form-data",
+          "X-Idempotency-Key": crypto.randomUUID()
+        }
       });
       setAvailableSheets(res.data);
       if (res.data.length > 0 && !sheetName) {
@@ -117,7 +120,10 @@ export function GoogleSheetsSyncDialog({ isOpen, onClose, syncType, onSyncComple
         : "/api/marketing/campaign-results/preview-sync";
 
       const res = await axios.post(endpoint, formData, {
-        headers: { "Content-Type": "multipart/form-data" }
+        headers: { 
+          "Content-Type": "multipart/form-data",
+          "X-Idempotency-Key": crypto.randomUUID()
+        }
       });
       
       setPreviewData(res.data);
@@ -146,7 +152,9 @@ export function GoogleSheetsSyncDialog({ isOpen, onClose, syncType, onSyncComple
         ? { leads: dataToCommit } 
         : { results: dataToCommit };
 
-      const res = await axios.post(endpoint, payload);
+      const res = await axios.post(endpoint, payload, {
+        headers: { "X-Idempotency-Key": crypto.randomUUID() }
+      });
       toast.success(res.data.message || "Sync successful");
       onClose();
       setPreviewData(null);

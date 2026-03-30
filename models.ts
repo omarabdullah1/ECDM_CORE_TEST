@@ -10,17 +10,21 @@ export interface IUser extends Document {
   role: UserRole;
   targetSales: number;
   targetBudget: number;
+  maxDiscountPercentage: number;
+  isActive: boolean;
   refreshToken?: string;
   createdAt: Date;
 }
 
 const UserSchema = new Schema<IUser>({
   name: { type: String, required: true },
-  email: { type: String, required: true, unique: true },
+  email: { type: String, required: true, unique: true, lowercase: true },
   passwordHash: { type: String, required: true },
   role: { type: String, enum: ["SuperAdmin", "Admin", "Manager", "Sales", "Marketing", "Operations", "Finance", "HR", "CustomerService"], default: "Sales" },
   targetSales: { type: Number, default: 0 },
   targetBudget: { type: Number, default: 0 },
+  maxDiscountPercentage: { type: Number, default: 0 },
+  isActive: { type: Boolean, default: true },
   refreshToken: { type: String },
   createdAt: { type: Date, default: Date.now },
 });
@@ -68,37 +72,143 @@ CustomerSchema.index({ name: 1, phone: 1 }, { unique: true });
 
 export const Customer = model<ICustomer>("Customer", CustomerSchema);
 
-export type FollowUpStatus = "Pending" | "Contacted" | "Quoted" | "Accepted" | "Scheduled" | "Rejected";
+// --- Category ---
+export interface ICategory extends Document {
+  name: string;
+  createdAt: Date;
+}
+
+const CategorySchema = new Schema<ICategory>({
+  name: { type: String, required: true, unique: true },
+  createdAt: { type: Date, default: Date.now },
+});
+
+export const Category = model<ICategory>("Category", CategorySchema);
+
+// --- Inventory ---
+export interface IInventory extends Document {
+  sparePartsId: string;
+  itemName: string;
+  specification: string;
+  dataSheetUrl?: string;
+  category: string;
+  unitPrice: number;
+  stockNumber: number;
+  notes?: string;
+  createdAt: Date;
+}
+
+const InventorySchema = new Schema<IInventory>({
+  sparePartsId: { type: String, required: true, unique: true },
+  itemName: { type: String, required: true },
+  specification: { type: String },
+  dataSheetUrl: { type: String },
+  category: { type: String, required: true },
+  unitPrice: { type: Number, required: true },
+  stockNumber: { type: Number, required: true, default: 0 },
+  notes: { type: String },
+  createdAt: { type: Date, default: Date.now },
+});
+
+export const Inventory = model<IInventory>("Inventory", InventorySchema);
+
+export type FollowUpStatus1st = "Select Status" | "Accepted" | "Rejected" | "Negotiation" | "Pending" | "Expired";
+export type FollowUpStatus2nd = "Select Status" | "Scheduled" | "Not Required" | "Pending";
+export type FollowUpStatus3rd = "Select Final Status" | "Accepted" | "Not Potential" | "Pending";
 
 export interface ISalesOrder extends Document {
   salesPersonId: Types.ObjectId;
-  customerId?: Types.ObjectId; // Link to Customer model
-  customerName: string; // Keep for legacy/quick entry
+  customerId?: Types.ObjectId;
+  
+  // Lead/Customer Info
+  customerCode?: string;
+  customerName: string;
   customerPhone: string;
-  customerEmail: string;
-  totalAmount: number;
+  customerEmail?: string;
+  address?: string;
+  sector?: string;
+  initialIssue?: string;
   
-  // 3-Stage Follow-up
-  quotationStatusFirstFollowUp: FollowUpStatus;
-  statusSecondFollowUp: FollowUpStatus;
-  finalStatusThirdFollowUp: FollowUpStatus;
+  // Order Details
+  orderIssue?: string;
+  typeOfOrder?: string;
+  totalAmount?: number;
+  platform?: string;
+  siteInspectionDate?: Date;
   
-  automationTriggered: boolean; // For idempotency
-  notes: string;
+  // Technical Inspection
+  technicalInspectionRequired?: boolean;
+  technicalInspectionDate?: Date;
+  technicalInspectionDetails?: string;
+  
+  // Quotation
+  quotationPdfUrl?: string;
+  quotationItems?: { itemId: Types.ObjectId; quantity: number; price: number }[];
+  discountPercentage?: number;
+  discountAmount?: number;
+  
+  // 1st Follow-up
+  followUpFirstDate?: Date;
+  quotationStatusFirstFollowUp?: FollowUpStatus1st;
+  reasonOfQuotation?: string;
+  
+  // 2nd Follow-up
+  followUpSecondDate?: Date;
+  statusSecondFollowUp?: FollowUpStatus2nd;
+  reasonOfSecondFollowUp?: string;
+  
+  // 3rd Follow-up
+  followUpThirdDate?: Date;
+  finalStatusThirdFollowUp?: FollowUpStatus3rd;
+  reasonOfThirdFollowUp?: string;
+  
+  automationTriggered: boolean;
+  notes?: string;
   createdAt: Date;
 }
 
 const SalesOrderSchema = new Schema<ISalesOrder>({
   salesPersonId: { type: Schema.Types.ObjectId, ref: "User", required: true },
   customerId: { type: Schema.Types.ObjectId, ref: "Customer" },
+  
+  customerCode: { type: String },
   customerName: { type: String, required: true },
   customerPhone: { type: String, required: true },
-  customerEmail: { type: String, required: true },
-  totalAmount: { type: Number, required: true },
+  customerEmail: { type: String },
+  address: { type: String },
+  sector: { type: String },
+  initialIssue: { type: String },
   
-  quotationStatusFirstFollowUp: { type: String, enum: ["Pending", "Contacted", "Quoted", "Accepted", "Scheduled", "Rejected"], default: "Pending" },
-  statusSecondFollowUp: { type: String, enum: ["Pending", "Contacted", "Quoted", "Accepted", "Scheduled", "Rejected"], default: "Pending" },
-  finalStatusThirdFollowUp: { type: String, enum: ["Pending", "Contacted", "Quoted", "Accepted", "Scheduled", "Rejected"], default: "Pending" },
+  orderIssue: { type: String },
+  typeOfOrder: { type: String },
+  totalAmount: { type: Number },
+  platform: { type: String },
+  siteInspectionDate: { type: Date },
+  
+  technicalInspectionRequired: { type: Boolean, default: false },
+  technicalInspectionDate: { type: Date },
+  technicalInspectionDetails: { type: String },
+  
+  quotationPdfUrl: { type: String },
+  quotationItems: [{
+    itemId: { type: Schema.Types.ObjectId, ref: "Inventory" },
+    quantity: { type: Number },
+    price: { type: Number }
+  }],
+  discountPercentage: { type: Number, default: 0 },
+  discountAmount: { type: Number, default: 0 },
+  
+  followUpFirstDate: { type: Date },
+  quotationStatusFirstFollowUp: { type: String, enum: ["Select Status", "Accepted", "Rejected", "Negotiation", "Pending", "Expired"], default: "Select Status" },
+  reasonOfQuotation: { type: String },
+  
+  followUpSecondDate: { type: Date },
+  statusSecondFollowUp: { type: String, enum: ["Select Status", "Scheduled", "Not Required", "Pending"], default: "Select Status" },
+  reasonOfSecondFollowUp: { type: String },
+  
+  followUpThirdDate: { type: Date },
+  finalStatusThirdFollowUp: { type: String, enum: ["Select Final Status", "Accepted", "Not Potential", "Pending"], default: "Select Final Status" },
+  reasonOfThirdFollowUp: { type: String },
   
   automationTriggered: { type: Boolean, default: false },
   notes: { type: String },
@@ -171,7 +281,7 @@ export interface ISupplier extends Document {
 const SupplierSchema = new Schema<ISupplier>({
   name: { type: String, required: true },
   contactPerson: { type: String },
-  email: { type: String, required: true, unique: true },
+  email: { type: String, required: true, unique: true, lowercase: true },
   phone: { type: String },
   address: { type: String },
   category: { type: String },
@@ -203,22 +313,6 @@ const PurchaseOrderSchema = new Schema<IPurchaseOrder>({
 export const PurchaseOrder = model<IPurchaseOrder>("PurchaseOrder", PurchaseOrderSchema);
 
 // --- Inventory & Finance ---
-export interface IInventory extends Document {
-  name: string;
-  stockNumber: number;
-  price: number;
-  category: string;
-}
-
-const InventorySchema = new Schema<IInventory>({
-  name: { type: String, required: true, unique: true },
-  stockNumber: { type: Number, required: true, default: 0 },
-  price: { type: Number, required: true, default: 0 },
-  category: { type: String },
-});
-
-export const Inventory = model<IInventory>("Inventory", InventorySchema);
-
 export interface IInvoice extends Document {
   customerOrderId: Types.ObjectId;
   total: number;
@@ -266,7 +360,7 @@ export interface IModificationRequest extends Document {
 }
 
 const ModificationRequestSchema = new Schema<IModificationRequest>({
-  entityId: { type: Schema.Types.ObjectId, required: true },
+  entityId: { type: Schema.Types.ObjectId, required: true, refPath: 'entityType' },
   entityType: { type: String, default: "SalesOrder" },
   requestedBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
   changes: { type: Schema.Types.Mixed },
@@ -383,8 +477,6 @@ const SalesLeadSchema = new Schema<ISalesLead>({
   isMarketingLead: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now },
 });
-
-SalesLeadSchema.index({ name: 1, phone: 1 }, { unique: true });
 
 export const SalesLead = model<ISalesLead>("SalesLead", SalesLeadSchema);
 
@@ -570,3 +662,20 @@ const SyncConfigSchema = new Schema<ISyncConfig>({
 });
 
 export const SyncConfig = model<ISyncConfig>("SyncConfig", SyncConfigSchema);
+
+// --- Processed Request (Idempotency) ---
+export interface IProcessedRequest extends Document {
+  idempotencyKey: string;
+  responseStatus: number;
+  responseBody: any;
+  createdAt: Date;
+}
+
+const ProcessedRequestSchema = new Schema<IProcessedRequest>({
+  idempotencyKey: { type: String, required: true, unique: true },
+  responseStatus: { type: Number, required: true },
+  responseBody: { type: Schema.Types.Mixed },
+  createdAt: { type: Date, default: Date.now, expires: '24h' }, // Expire after 24 hours
+});
+
+export const ProcessedRequest = model<IProcessedRequest>("ProcessedRequest", ProcessedRequestSchema);

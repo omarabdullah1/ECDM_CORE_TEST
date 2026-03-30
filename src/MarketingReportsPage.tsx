@@ -37,6 +37,7 @@ const MarketingReportsPage = () => {
     topChannel: "",
     summary: ""
   });
+  const [isSaving, setIsSaving] = useState(false);
 
   console.log("MarketingReportsPage: user", user);
 
@@ -89,18 +90,27 @@ const MarketingReportsPage = () => {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSaving) return;
+    setIsSaving(true);
     try {
+      const config = {
+        headers: {
+          "X-Idempotency-Key": crypto.randomUUID()
+        }
+      };
       if (selectedReport) {
-        await axios.patch(`/api/marketing/reports/${selectedReport._id}`, formData);
+        await axios.patch(`/api/marketing/reports/${selectedReport._id}`, formData, config);
         toast.success("Marketing report updated successfully");
       } else {
-        await axios.post("/api/marketing/reports", formData);
+        await axios.post("/api/marketing/reports", formData, config);
         toast.success("Marketing report added successfully");
       }
       setShowModal(false);
       fetchReports();
     } catch (error: any) {
       toast.error(error.response?.data?.error || "Failed to save report");
+    } finally {
+      setIsSaving(false);
     }
   };
 
@@ -321,9 +331,10 @@ const MarketingReportsPage = () => {
           {!isPreviewOnly && (
             <button 
               type="submit"
-              className="w-full bg-neutral-900 text-white py-4 rounded-2xl font-bold hover:bg-neutral-800 transition-all shadow-lg shadow-neutral-200"
+              disabled={isSaving}
+              className="w-full bg-neutral-900 text-white py-4 rounded-2xl font-bold hover:bg-neutral-800 transition-all shadow-lg shadow-neutral-200 disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {selectedReport ? "Update Report" : "Save Report"}
+              {isSaving ? "Saving..." : (selectedReport ? "Update Report" : "Save Report")}
             </button>
           )}
         </form>

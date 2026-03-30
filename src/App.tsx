@@ -1809,12 +1809,16 @@ const SalesOrdersPage = () => {
   const [discountPercentage, setDiscountPercentage] = useState(0);
 
   // Follow-up state
-  const [status, setStatus] = useState(selectedOrder?.finalStatusThirdFollowUp || "Pending");
+  const [f1Status, setF1Status] = useState(selectedOrder?.quotationStatusFirstFollowUp || "Select Status");
+  const [f2Status, setF2Status] = useState(selectedOrder?.statusSecondFollowUp || "Select Status");
+  const [f3Status, setF3Status] = useState(selectedOrder?.finalStatusThirdFollowUp || "Select Final Status");
   const [showTechInspection, setShowTechInspection] = useState(selectedOrder?.technicalInspectionRequired || false);
 
   useEffect(() => {
     if (selectedOrder) {
-      setStatus(selectedOrder.finalStatusThirdFollowUp || "Pending");
+      setF1Status(selectedOrder.quotationStatusFirstFollowUp || "Select Status");
+      setF2Status(selectedOrder.statusSecondFollowUp || "Select Status");
+      setF3Status(selectedOrder.finalStatusThirdFollowUp || "Select Final Status");
       setShowTechInspection(selectedOrder.technicalInspectionRequired || false);
       setDiscountPercentage(selectedOrder.discountPercentage || 0);
       setQuotationItems(selectedOrder.quotationItems?.map((i: any) => ({
@@ -2021,7 +2025,7 @@ const SalesOrdersPage = () => {
       </header>
 
       <div className="bg-white rounded-3xl border border-neutral-200 shadow-sm overflow-x-auto">
-        <table className="w-full text-left min-w-[1200px]">
+        <table className="w-full text-left min-w-[2000px]">
           <thead>
             <tr className="bg-neutral-50 text-neutral-400 text-[10px] font-bold uppercase tracking-widest border-b border-neutral-100">
               <th className="px-4 py-4 w-10">
@@ -2046,7 +2050,14 @@ const SalesOrdersPage = () => {
               <th className="px-4 py-4">Site Inspections</th>
               <th className="px-4 py-4">Technical Inspection</th>
               <th className="px-4 py-4">Quotation PDF</th>
-              <th className="px-4 py-4">Status</th>
+              <th className="px-4 py-4">Follow Up 1st</th>
+              <th className="px-4 py-4">Status 1st</th>
+              <th className="px-4 py-4">Reason</th>
+              <th className="px-4 py-4">Follow Up 2nd</th>
+              <th className="px-4 py-4">Status 2nd</th>
+              <th className="px-4 py-4">Follow Up 3rd</th>
+              <th className="px-4 py-4">Final Status</th>
+              <th className="px-4 py-4">Notes</th>
               <th className="px-4 py-4 text-right">Actions</th>
             </tr>
           </thead>
@@ -2098,14 +2109,21 @@ const SalesOrdersPage = () => {
                       </button>
                     ) : "---"}
                   </td>
+                  <td className="px-4 py-4">{order.followUpFirstDate ? new Date(order.followUpFirstDate).toLocaleDateString() : "---"}</td>
                   <td className="px-4 py-4">
                     <span className={cn(
                       "px-2 py-1 rounded-full text-[10px] font-bold",
-                      order.finalStatusThirdFollowUp === "Accepted" ? "bg-green-100 text-green-700" :
-                      order.finalStatusThirdFollowUp === "Not Potential" ? "bg-red-100 text-red-700" :
+                      order.quotationStatusFirstFollowUp === "Accepted" ? "bg-green-100 text-green-700" :
+                      order.quotationStatusFirstFollowUp === "Rejected" ? "bg-red-100 text-red-700" :
                       "bg-neutral-100 text-neutral-700"
-                    )}>{order.finalStatusThirdFollowUp || "Pending"}</span>
+                    )}>{order.quotationStatusFirstFollowUp || "Select Status"}</span>
                   </td>
+                  <td className="px-4 py-4 max-w-[100px] truncate" title={order.reasonOfQuotation}>{order.reasonOfQuotation || "---"}</td>
+                  <td className="px-4 py-4">{order.followUpSecondDate ? new Date(order.followUpSecondDate).toLocaleDateString() : "---"}</td>
+                  <td className="px-4 py-4">{order.statusSecondFollowUp || "Select Status"}</td>
+                  <td className="px-4 py-4">{order.followUpThirdDate ? new Date(order.followUpThirdDate).toLocaleDateString() : "---"}</td>
+                  <td className="px-4 py-4">{order.finalStatusThirdFollowUp || "Select Final Status"}</td>
+                  <td className="px-4 py-4 max-w-[150px] truncate" title={order.notes}>{order.notes || "---"}</td>
                   <td className="px-4 py-4 text-right" onClick={e => e.stopPropagation()}>
                     <div className="flex justify-end gap-2">
                       {isAdmin && (
@@ -2235,20 +2253,6 @@ const SalesOrdersPage = () => {
                     />
                   </div>
                   <div>
-                    <label className="block text-xs font-bold text-neutral-400 uppercase tracking-widest mb-2">Order Status</label>
-                    <select 
-                      name="finalStatusThirdFollowUp" 
-                      defaultValue={selectedOrder.finalStatusThirdFollowUp || "Pending"} 
-                      disabled={!canEdit(selectedOrder)}
-                      onChange={(e) => setStatus(e.target.value)}
-                      className="w-full px-4 py-2 bg-white border border-neutral-200 rounded-xl outline-none focus:ring-2 focus:ring-neutral-900"
-                    >
-                      {["Pending", "Accepted", "Not Potential"].map(opt => (
-                        <option key={opt} value={opt}>{opt}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div>
                     <label className="block text-xs font-bold text-neutral-400 uppercase tracking-widest mb-2">Site Inspection Date</label>
                     <input 
                       name="siteInspectionDate" 
@@ -2321,7 +2325,144 @@ const SalesOrdersPage = () => {
                 </div>
               </div>
             </div>
-            
+
+            {/* Follow-ups */}
+            <div className="space-y-4">
+              <h3 className="text-sm font-bold text-neutral-900 uppercase tracking-widest border-b border-neutral-200 pb-2">Follow-Ups</h3>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                {/* 1st Follow-up */}
+                <div className="space-y-4 bg-neutral-50 p-4 rounded-xl border border-neutral-200">
+                  <h4 className="font-bold text-sm text-neutral-800">1st Follow-Up</h4>
+                  <div>
+                    <label className="block text-[10px] font-bold text-neutral-400 uppercase tracking-widest mb-1">Date & Time</label>
+                    <input 
+                      name="followUpFirstDate" 
+                      type="datetime-local"
+                      defaultValue={selectedOrder.followUpFirstDate ? new Date(selectedOrder.followUpFirstDate).toISOString().slice(0, 16) : ''} 
+                      readOnly={!canEdit(selectedOrder)} 
+                      className="w-full px-3 py-2 bg-white border border-neutral-200 rounded-lg outline-none focus:ring-2 focus:ring-neutral-900 text-sm" 
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-bold text-neutral-400 uppercase tracking-widest mb-1">Status</label>
+                    <select 
+                      name="quotationStatusFirstFollowUp" 
+                      defaultValue={selectedOrder.quotationStatusFirstFollowUp} 
+                      disabled={!canEdit(selectedOrder)}
+                      onChange={(e) => setF1Status(e.target.value)}
+                      className="w-full px-3 py-2 bg-white border border-neutral-200 rounded-lg outline-none focus:ring-2 focus:ring-neutral-900 text-sm"
+                    >
+                      {["Select Status", "Accepted", "Rejected", "Negotiation", "Pending", "Expired"].map(opt => (
+                        <option key={opt} value={opt}>{opt}</option>
+                      ))}
+                    </select>
+                  </div>
+                  {f1Status !== "Accepted" && f1Status !== "Select Status" && (
+                    <div>
+                      <label className="block text-[10px] font-bold text-neutral-400 uppercase tracking-widest mb-1">Reason</label>
+                      <input 
+                        name="reasonOfQuotation" 
+                        defaultValue={selectedOrder.reasonOfQuotation} 
+                        readOnly={!canEdit(selectedOrder)} 
+                        className="w-full px-3 py-2 bg-white border border-neutral-200 rounded-lg outline-none focus:ring-2 focus:ring-neutral-900 text-sm" 
+                      />
+                    </div>
+                  )}
+                </div>
+
+                {/* 2nd Follow-up */}
+                <div className={`space-y-4 bg-neutral-50 p-4 rounded-xl border border-neutral-200 ${f1Status === "Accepted" ? "opacity-50 pointer-events-none" : ""}`}>
+                  <h4 className="font-bold text-sm text-neutral-800">2nd Follow-Up</h4>
+                  <div>
+                    <label className="block text-[10px] font-bold text-neutral-400 uppercase tracking-widest mb-1">Date & Time</label>
+                    <input 
+                      name="followUpSecondDate" 
+                      type="datetime-local"
+                      defaultValue={selectedOrder.followUpSecondDate ? new Date(selectedOrder.followUpSecondDate).toISOString().slice(0, 16) : ''} 
+                      readOnly={!canEdit(selectedOrder)} 
+                      className="w-full px-3 py-2 bg-white border border-neutral-200 rounded-lg outline-none focus:ring-2 focus:ring-neutral-900 text-sm" 
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-bold text-neutral-400 uppercase tracking-widest mb-1">Status</label>
+                    <select 
+                      name="statusSecondFollowUp" 
+                      defaultValue={selectedOrder.statusSecondFollowUp} 
+                      disabled={!canEdit(selectedOrder) || f1Status === "Accepted"}
+                      onChange={(e) => setF2Status(e.target.value)}
+                      className="w-full px-3 py-2 bg-white border border-neutral-200 rounded-lg outline-none focus:ring-2 focus:ring-neutral-900 text-sm"
+                    >
+                      {["Select Status", "Scheduled", "Not Required", "Pending"].map(opt => (
+                        <option key={opt} value={opt}>{opt}</option>
+                      ))}
+                    </select>
+                  </div>
+                  {f2Status !== "Scheduled" && f2Status !== "Select Status" && (
+                    <div>
+                      <label className="block text-[10px] font-bold text-neutral-400 uppercase tracking-widest mb-1">Reason</label>
+                      <input 
+                        name="reasonOfSecondFollowUp" 
+                        defaultValue={selectedOrder.reasonOfSecondFollowUp} 
+                        readOnly={!canEdit(selectedOrder)} 
+                        className="w-full px-3 py-2 bg-white border border-neutral-200 rounded-lg outline-none focus:ring-2 focus:ring-neutral-900 text-sm" 
+                      />
+                    </div>
+                  )}
+                </div>
+
+                {/* 3rd Follow-up */}
+                <div className={`space-y-4 bg-neutral-50 p-4 rounded-xl border border-neutral-200 ${(f1Status === "Accepted" || f2Status === "Scheduled") ? "opacity-50 pointer-events-none" : ""}`}>
+                  <h4 className="font-bold text-sm text-neutral-800">3rd Follow-Up</h4>
+                  <div>
+                    <label className="block text-[10px] font-bold text-neutral-400 uppercase tracking-widest mb-1">Date & Time</label>
+                    <input 
+                      name="followUpThirdDate" 
+                      type="datetime-local"
+                      defaultValue={selectedOrder.followUpThirdDate ? new Date(selectedOrder.followUpThirdDate).toISOString().slice(0, 16) : ''} 
+                      readOnly={!canEdit(selectedOrder)} 
+                      className="w-full px-3 py-2 bg-white border border-neutral-200 rounded-lg outline-none focus:ring-2 focus:ring-neutral-900 text-sm" 
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-bold text-neutral-400 uppercase tracking-widest mb-1">Final Status</label>
+                    <select 
+                      name="finalStatusThirdFollowUp" 
+                      defaultValue={selectedOrder.finalStatusThirdFollowUp} 
+                      disabled={!canEdit(selectedOrder) || f1Status === "Accepted" || f2Status === "Scheduled"}
+                      onChange={(e) => setF3Status(e.target.value)}
+                      className="w-full px-3 py-2 bg-white border border-neutral-200 rounded-lg outline-none focus:ring-2 focus:ring-neutral-900 text-sm"
+                    >
+                      {["Select Final Status", "Accepted", "Not Potential", "Pending"].map(opt => (
+                        <option key={opt} value={opt}>{opt}</option>
+                      ))}
+                    </select>
+                  </div>
+                  {f3Status !== "Accepted" && f3Status !== "Select Final Status" && (
+                    <div>
+                      <label className="block text-[10px] font-bold text-neutral-400 uppercase tracking-widest mb-1">Reason</label>
+                      <input 
+                        name="reasonOfThirdFollowUp" 
+                        defaultValue={selectedOrder.reasonOfThirdFollowUp} 
+                        readOnly={!canEdit(selectedOrder)} 
+                        className="w-full px-3 py-2 bg-white border border-neutral-200 rounded-lg outline-none focus:ring-2 focus:ring-neutral-900 text-sm" 
+                      />
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="space-y-4">
+              <label className="block text-xs font-bold text-neutral-400 uppercase tracking-widest mb-2">Order Notes</label>
+              <textarea 
+                name="notes" 
+                defaultValue={selectedOrder.notes} 
+                readOnly={!canEdit(selectedOrder)} 
+                rows={3}
+                className="w-full px-4 py-3 bg-white border border-neutral-200 rounded-xl outline-none focus:ring-2 focus:ring-neutral-900 resize-none" 
+              />
+            </div>
+
             {canEdit(selectedOrder) && (
               <div className="flex gap-4 pt-4 border-t border-neutral-100">
                 <button type="button" onClick={() => setSelectedOrder(null)} className="flex-1 py-4 bg-neutral-100 text-neutral-600 rounded-xl font-bold hover:bg-neutral-200 transition-all">Cancel</button>
